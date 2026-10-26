@@ -59,12 +59,12 @@ Lo hace **una persona** con acceso de administrador a la cuenta AWS.
    - Si **ya existe**: pon `CrearProveedorOidc = false` (solo puede haber uno por cuenta).
 2. **CloudFormation → Create stack → With new resources → Upload a template file** → `anidados/conexion/github-oidc.yaml`.
 3. **Stack name:** `conexion-github-asistencia`. No uses un nombre que empiece con `asistencia-`, porque ese prefijo queda reservado para los stacks del pipeline.
-4. Deja los valores por defecto (`escobarnina` / `Mi-asistencia` / `main`) → Next → Next → marca **"I acknowledge that AWS CloudFormation might create IAM resources with custom names"** → **Submit**.
+4. Deja los valores por defecto (`escobarnina` / `prueba-cfn-asistencia` / `main`) → Next → Next → marca **"I acknowledge that AWS CloudFormation might create IAM resources with custom names"** → **Submit**.
 5. Cuando diga `CREATE_COMPLETE`, revisa la pestaña **Outputs**. Verás 2 roles y 1 bucket:
 
 | Recurso | Para qué |
 |---|---|
-| `asistencia-github-actions` | Rol que asume GitHub, **solo** desde `escobarnina/Mi-asistencia` rama `main`, sin llaves guardadas |
+| `asistencia-github-actions` | Rol que asume GitHub, **solo** desde `escobarnina/prueba-cfn-asistencia` rama `main`, sin llaves guardadas |
 | `asistencia-cfn-ejecucion` | Rol que usa CloudFormation para crear los recursos; GitHub solo puede "pasárselo" |
 | `asistencia-cfn-plantillas-<cuenta>` | Bucket privado y cifrado donde se suben las plantillas hijas |
 
