@@ -19,7 +19,7 @@ jobs:
   probar:
     runs-on: ubuntu-latest
     steps:
-          - name: 0. Ver el token que presenta GitHub
+      - name: 0. Ver el token que presenta GitHub
         uses: actions/github-script@v7
         with:
           script: |
