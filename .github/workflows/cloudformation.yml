@@ -1,0 +1,147 @@
+# =====================================================================
+#  CloudFormation con plantillas anidadas, sincronizado con Git.
+#
+#  Pull Request  -> valida (cfn-lint) y escanea (cfn-nag, Trivy, KICS). No toca AWS.
+#  Push a main   -> valida, escanea, sube las plantillas hijas a S3 y actualiza el stack.
+#
+#  No usa llaves de AWS: GitHub se autentica con OIDC contra el rol
+#  asistencia-github-actions (creado con anidados/conexion/github-oidc.yaml).
+# =====================================================================
+name: CloudFormation (anidados)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "anidados/**"
+      - ".github/workflows/cloudformation.yml"
+  pull_request:
+    paths:
+      - "anidados/**"
+      - ".github/workflows/cloudformation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "355628740150"     # cuenta AWS donde se creó conexion-github-asistencia
+  AMBIENTE: dev                      # lee anidados/parametros/dev.env -> stack asistencia-dev
+
+jobs:
+  validar:
+    name: Validar y escanear
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "0. cfn-lint (bloquea si hay errores)"
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint anidados/*.yaml anidados/conexion/*.yaml
+
+      - name: Preparar carpeta de reportes
+        run: mkdir -p reportes/kics && chmod -R 777 reportes
+
+      - name: "1. cfn-nag (seguridad propia de CloudFormation)"
+        continue-on-error: true
+        run: |
+          docker run --rm --entrypoint cfn_nag_scan -v "$PWD/anidados:/templates" \
+            stelligent/cfn_nag --input-path /templates | tee reportes/cfn-nag.txt
+
+      - name: "2. Trivy (malas configuraciones IaC)"
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD/anidados:/src" aquasec/trivy \
+            config --exit-code 1 /src | tee reportes/trivy.txt
+
+      - name: "3. KICS (cumplimiento CIS/NIST)"
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/w" checkmarx/kics scan \
+            -p /w/anidados -o /w/reportes/kics --report-formats "html,json"
+
+      - name: Guardar reportes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reportes-seguridad
+          path: reportes/
+
+  desplegar:
+    name: Desplegar en AWS
+    needs: validar
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write                # necesario para OIDC
+    concurrency:
+      group: despliegue-${{ github.ref }}
+      cancel-in-progress: false      # nunca cortar un despliegue a la mitad
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Autenticarse en AWS (OIDC, sin llaves)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/asistencia-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Leer parametros del ambiente
+        run: |
+          ARCHIVO="anidados/parametros/${AMBIENTE}.env"
+          PARAMS=$(grep -Ev '^[[:space:]]*(#|$)' "$ARCHIVO" | tr '\n' ' ')
+          if echo "$PARAMS" | grep -q 'X.X.X.X'; then
+            echo "::error file=$ARCHIVO::Falta completar MiIp con tu IP publica (x.x.x.x/32)"
+            exit 1
+          fi
+          PROYECTO=$(grep -E '^Proyecto=' "$ARCHIVO" | cut -d= -f2)
+          echo "PARAMS=$PARAMS" >> "$GITHUB_ENV"
+          echo "STACK=${PROYECTO}-${AMBIENTE}" >> "$GITHUB_ENV"
+
+      - name: Subir plantillas hijas a S3 (package)
+        run: |
+          aws cloudformation package \
+            --template-file anidados/main.yaml \
+            --s3-bucket "asistencia-cfn-plantillas-${AWS_ACCOUNT_ID}" \
+            --s3-prefix "${AMBIENTE}" \
+            --output-template-file empaquetado.yaml
+          echo "TemplateURL reemplazadas por:"
+          grep TemplateURL empaquetado.yaml
+
+      - name: Crear o actualizar el stack
+        run: |
+          aws cloudformation deploy \
+            --template-file empaquetado.yaml \
+            --stack-name "$STACK" \
+            --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/asistencia-cfn-ejecucion" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides $PARAMS \
+            --tags proyecto=asistencia ambiente="$AMBIENTE" \
+            --no-fail-on-empty-changeset
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "## Stack \`$STACK\` (commit \`${GITHUB_SHA::7}\` de @${GITHUB_ACTOR})"
+            echo '```'
+            aws cloudformation describe-stacks --stack-name "$STACK" \
+              --query "Stacks[0].[StackStatus, LastUpdatedTime || CreationTime]" --output text || true
+            aws cloudformation describe-stacks --stack-name "$STACK" \
+              --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ver por que fallo
+        if: failure()
+        run: |
+          aws cloudformation describe-stack-events --stack-name "$STACK" --max-items 25 \
+            --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" \
+            --output table || true
