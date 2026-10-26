@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Capa 4 - SERVIDOR (EC2 reutilizable). La misma plantilla crea el backend o el frontend
+  segun el parametro Rol. El endurecimiento (IMDSv2, disco cifrado, etiquetas) se escribe una
+  sola vez y lo heredan los dos servidores.
+
+Parameters:
+  Proyecto:
+    Type: String
+  Ambiente:
+    Type: String
+  Rol:
+    Type: String
+    AllowedValues: [backend, frontend]
+  TipoInstancia:
+    Type: String
+  TamanoDisco:
+    Type: Number
+  AmiId:
+    Type: AWS::EC2::Image::Id
+  SubredId:
+    Type: AWS::EC2::Subnet::Id
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  NombreLlave:
+    Type: AWS::EC2::KeyPair::KeyName
+  RepoUrl:
+    Type: String
+  RepoRama:
+    Type: String
+  # --- Solo backend ---
+  PerfilInstancia:
+    Type: String
+    Default: ""
+  ArnSecretoAdmin:
+    Type: String
+    Default: ""
+  AdminEmail:
+    Type: String
+    Default: admin@ejemplo.com
+  CargarSemilla:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  # --- Solo frontend ---
+  BackendIpPrivada:
+    Type: String
+    Default: ""
+
+Conditions:
+  EsBackend: !Equals [!Ref Rol, backend]
+  TienePerfil: !Not [!Equals [!Ref PerfilInstancia, ""]]
+  EsT3: !Equals [!Select [0, !Split [".", !Ref TipoInstancia]], t3]
+
+Resources:
+  Instancia:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref TipoInstancia
+      SubnetId: !Ref SubredId
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      KeyName: !Ref NombreLlave
+      IamInstanceProfile: !If [TienePerfil, !Ref PerfilInstancia, !Ref AWS::NoValue]
+      EbsOptimized: !If [EsT3, true, false]
+      MetadataOptions:              # IMDSv2 obligatorio (evita robo de credenciales por SSRF)
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref TamanoDisco
+            VolumeType: gp3
+            Encrypted: true         # disco cifrado
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Proyecto}-${Ambiente}-${Rol}" }
+        - { Key: rol, Value: !Ref Rol }
+        - { Key: ambiente, Value: !Ref Ambiente }
+      UserData: !If
+        - EsBackend
+        # =================================================================
+        #  BACKEND: Node 20 + MySQL 8 local + systemd. Log: /var/log/despliegue.log
+        # =================================================================
+        - Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/despliegue.log 2>&1
+            export DEBIAN_FRONTEND=noninteractive
+            export HOME=/root
+            APT="apt-get -y -o DPkg::Lock::Timeout=300"
+
+            # 1. Zona horaria y swap (la micro solo tiene 1 GB de RAM)
+            timedatectl set-timezone America/La_Paz
+            if [ ! -f /swapfile ]; then
+              fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+              echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+
+            # 2. Paquetes: git, MySQL 8, Node.js 20 y AWS CLI
+            $APT update
+            $APT install git curl ca-certificates openssl mysql-server
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            $APT install nodejs
+            snap wait system seed.loaded
+            snap install aws-cli --classic
+
+            # 3. Secretos: DB y JWT se generan AQUI y nunca salen de la VM;
+            #    la clave del admin se lee de Secrets Manager con el rol IAM.
+            DB_PASS=$(openssl rand -hex 20)
+            JWT=$(openssl rand -hex 32)
+            ADMIN_PASS=$(/snap/bin/aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${ArnSecretoAdmin} --query SecretString --output text)
+
+            # 4. MySQL: utf8mb4, solo escucha en localhost
+            cat > /etc/mysql/mysql.conf.d/zz-asistencia.cnf <<'EOF'
+            [mysqld]
+            character-set-server = utf8mb4
+            collation-server     = utf8mb4_unicode_ci
+            bind-address         = 127.0.0.1
+            EOF
+            systemctl restart mysql
+            mysql <<EOF
+            CREATE DATABASE IF NOT EXISTS asistencia CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+            CREATE USER IF NOT EXISTS 'asistencia'@'localhost' IDENTIFIED BY '$DB_PASS';
+            CREATE USER IF NOT EXISTS 'asistencia'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
+            GRANT ALL PRIVILEGES ON asistencia.* TO 'asistencia'@'localhost';
+            GRANT ALL PRIVILEGES ON asistencia.* TO 'asistencia'@'127.0.0.1';
+            FLUSH PRIVILEGES;
+            EOF
+
+            # 5. Usuario de sistema, codigo y .env (en la raiz del repo)
+            id asistencia || useradd --system --create-home --shell /bin/bash asistencia
+            rm -rf /opt/asistencia
+            git clone --branch ${RepoRama} --depth 1 ${RepoUrl} /opt/asistencia
+            cat > /opt/asistencia/.env <<EOF
+            NODE_ENV=production
+            PORT=8000
+            DB_HOST=127.0.0.1
+            DB_PORT=3306
+            MYSQL_DATABASE=asistencia
+            MYSQL_USER=asistencia
+            MYSQL_PASSWORD=$DB_PASS
+            JWT_SECRET=$JWT
+            JWT_MINUTOS=480
+            ADMIN_EMAIL=${AdminEmail}
+            ADMIN_PASSWORD='$ADMIN_PASS'
+            TZ=America/La_Paz
+            CORS_ORIGINS=http://localhost:5173
+            EOF
+            unset DB_PASS JWT ADMIN_PASS
+            chmod 600 /opt/asistencia/.env
+            chown -R asistencia:asistencia /opt/asistencia
+
+            # 6. Dependencias + migraciones (+ semilla)
+            sudo -u asistencia -H bash -c 'cd /opt/asistencia/backend && npm ci && NODE_ENV=production npm run migrate'
+            if [ "${CargarSemilla}" = "true" ]; then
+              sudo -u asistencia -H bash -c 'cd /opt/asistencia/backend && NODE_ENV=production npm run seed'
+            fi
+
+            # 7. Servicio systemd
+            cat > /etc/systemd/system/asistencia-backend.service <<'EOF'
+            [Unit]
+            Description=Sistema de Asistencia - Backend (Node/Express)
+            After=network.target mysql.service
+            Requires=mysql.service
+
+            [Service]
+            User=asistencia
+            WorkingDirectory=/opt/asistencia/backend
+            Environment=NODE_ENV=production
+            ExecStart=/usr/bin/node src/server.js
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now asistencia-backend
+
+            # 8. Actualizar desde GitHub: sudo actualizar-backend
+            cat > /usr/local/bin/actualizar-backend <<'EOF'
+            #!/bin/bash
+            set -e
+            sudo -u asistencia -H bash -c 'cd /opt/asistencia && git pull && cd backend && npm ci && NODE_ENV=production npm run migrate'
+            systemctl restart asistencia-backend
+            sleep 2 && curl -s http://127.0.0.1:8000/api/health && echo
+            EOF
+            chmod +x /usr/local/bin/actualizar-backend
+
+            sleep 3
+            curl -s http://127.0.0.1:8000/api/health
+            echo "=== BACKEND LISTO ==="
+        # =================================================================
+        #  FRONTEND: build de Vite + nginx con proxy /api. Log: /var/log/despliegue.log
+        # =================================================================
+        - Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/despliegue.log 2>&1
+            export DEBIAN_FRONTEND=noninteractive
+            export HOME=/root
+            APT="apt-get -y -o DPkg::Lock::Timeout=300"
+            BACKEND="${BackendIpPrivada}"
+
+            # 1. Swap de 2 GB: el build de Vite no entra en 1 GB de RAM
+            timedatectl set-timezone America/La_Paz
+            if [ ! -f /swapfile ]; then
+              fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+              echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+
+            # 2. Paquetes: nginx, git y Node.js 20 (solo para compilar)
+            $APT update
+            $APT install nginx git curl ca-certificates
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            $APT install nodejs
+
+            # 3. Codigo y build de produccion
+            rm -rf /opt/asistencia
+            git clone --branch ${RepoRama} --depth 1 ${RepoUrl} /opt/asistencia
+            cd /opt/asistencia/frontend
+            npm ci
+            npm run build
+            mkdir -p /var/www/asistencia
+            rm -rf /var/www/asistencia/*
+            cp -r dist/* /var/www/asistencia/
+
+            # 4. nginx: sirve la SPA y reenvia /api al backend por IP privada
+            cat > /etc/nginx/sites-available/asistencia <<EOF
+            server {
+                listen 80 default_server;
+                server_name _;
+                server_tokens off;
+
+                root /var/www/asistencia;
+                index index.html;
+                client_max_body_size 10m;
+
+                location /api/ {
+                    proxy_pass http://$BACKEND:8000;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                }
+
+                location / {
+                    try_files \$uri \$uri/ /index.html;
+                }
+            }
+            EOF
+            rm -f /etc/nginx/sites-enabled/default
+            ln -sf /etc/nginx/sites-available/asistencia /etc/nginx/sites-enabled/asistencia
+            nginx -t
+            systemctl enable nginx
+            systemctl restart nginx
+
+            # 5. Actualizar desde GitHub: sudo actualizar-frontend
+            cat > /usr/local/bin/actualizar-frontend <<'EOF'
+            #!/bin/bash
+            set -e
+            export HOME=/root
+            cd /opt/asistencia && git pull
+            cd frontend && npm ci && npm run build
+            rm -rf /var/www/asistencia/* && cp -r dist/* /var/www/asistencia/
+            systemctl reload nginx
+            echo "Frontend actualizado"
+            EOF
+            chmod +x /usr/local/bin/actualizar-frontend
+
+            echo "=== FRONTEND LISTO ==="
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instancia
+  IpPublica:
+    Value: !GetAtt Instancia.PublicIp
+  IpPrivada:
+    Value: !GetAtt Instancia.PrivateIp

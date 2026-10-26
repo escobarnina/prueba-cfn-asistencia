@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CONEXION GitHub <-> AWS (se crea UNA sola vez, a mano, desde la consola).
+  Permite que GitHub Actions despliegue el stack del proyecto SIN guardar llaves de AWS en GitHub:
+  GitHub presenta un token OIDC firmado y AWS le entrega credenciales temporales (1 hora).
+  Crea: proveedor OIDC de GitHub, rol para GitHub Actions, rol de ejecucion de CloudFormation
+  y el bucket S3 donde se suben las plantillas anidadas.
+  Nombre sugerido del stack: conexion-github-asistencia
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: escobarnina
+    Description: Dueño del repositorio en GitHub.
+  GitHubRepo:
+    Type: String
+    Default: Mi-asistencia
+  RamaDespliegue:
+    Type: String
+    Default: main
+    Description: Solo los push a esta rama pueden desplegar.
+  Proyecto:
+    Type: String
+    Default: asistencia
+    Description: Prefijo de los stacks que el pipeline puede crear (asistencia-dev, asistencia-prod...).
+  CrearProveedorOidc:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      false si la cuenta YA tiene el proveedor token.actions.githubusercontent.com
+      (IAM > Identity providers). Solo puede existir uno por cuenta.
+
+Conditions:
+  CrearOidc: !Equals [!Ref CrearProveedorOidc, "true"]
+
+Resources:
+  ProveedorGithub:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CrearOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # ---------------- Bucket de plantillas anidadas ----------------
+  BucketPlantillas:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Proyecto}-cfn-plantillas-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: limpiar-plantillas-viejas
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  PoliticaBucket:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketPlantillas
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SoloHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt BucketPlantillas.Arn
+              - !Sub "${BucketPlantillas.Arn}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # ---------------- Rol que usa CloudFormation para crear los recursos ----------------
+  RolEjecucionCfn:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Proyecto}-cfn-ejecucion"
+      Description: CloudFormation asume este rol para crear la red, los SG, la llave, el secreto y las VMs
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+      Policies:
+        - PolicyName: recursos-del-proyecto
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StacksAnidados
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Proyecto}-*/*"
+              - Sid: LeerPlantillas
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${BucketPlantillas.Arn}/*"
+              - Sid: SecretoDelAdminSoloConPrefijo
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:asistencia-app/*"
+              - Sid: GenerarContrasena
+                Effect: Allow
+                Action: secretsmanager:GetRandomPassword   # esta accion no admite recurso
+                Resource: "*"
+              - Sid: LlaveSshEnParameterStore
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:DeleteParameter, ssm:GetParameter, ssm:AddTagsToResource]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/keypair/*"
+              - Sid: AmiDeUbuntu
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}::parameter/aws/service/canonical/*"
+              - Sid: RolDelBackendSoloBajoSuPath
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagInstanceProfile
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/asistencia-app/*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/asistencia-app/*"
+              - Sid: PasarRolSoloAEc2
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/asistencia-app/*"
+                Condition:
+                  StringEquals: { "iam:PassedToService": ec2.amazonaws.com }
+
+  # ---------------- Rol que asume GitHub Actions (OIDC) ----------------
+  RolGithubActions:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Proyecto}-github-actions"
+      Description: Lo asume GitHub Actions del repo indicado, solo desde la rama de despliegue
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${RamaDespliegue}"
+      Policies:
+        - PolicyName: desplegar-stack-del-proyecto
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SoloStacksDelProyecto
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Proyecto}-*/*"
+              - Sid: AccionesSinRecurso
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: SubirPlantillas
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "${BucketPlantillas.Arn}/*"
+              - Sid: ListarBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt BucketPlantillas.Arn
+              - Sid: AmiDeUbuntu
+                Effect: Allow
+                Action: [ssm:GetParameters]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}::parameter/aws/service/canonical/*"
+              - Sid: PasarSoloElRolDeEjecucion
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt RolEjecucionCfn.Arn
+                Condition:
+                  StringEquals: { "iam:PassedToService": cloudformation.amazonaws.com }
+
+Outputs:
+  RolGithubActionsArn:
+    Description: Va en el workflow (AWS_ROLE_GITHUB)
+    Value: !GetAtt RolGithubActions.Arn
+  RolEjecucionCfnArn:
+    Description: Va en el workflow (AWS_ROLE_CFN)
+    Value: !GetAtt RolEjecucionCfn.Arn
+  BucketPlantillas:
+    Description: Va en el workflow (BUCKET_PLANTILLAS)
+    Value: !Ref BucketPlantillas

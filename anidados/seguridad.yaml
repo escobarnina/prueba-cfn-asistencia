@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Capa 2 - SEGURIDAD DE RED. Security Groups del frontend y del backend.
+  SSH solo desde una IP, MySQL nunca expuesto y salidas limitadas a 80/443.
+
+Parameters:
+  Proyecto:
+    Type: String
+  Ambiente:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  MiIp:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/32$"
+    ConstraintDescription: Debe ser UNA IP en formato x.x.x.x/32 (nunca 0.0.0.0/0).
+  BackendPublico:
+    Type: String
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  EsPublico: !Equals [!Ref BackendPublico, "true"]
+
+Resources:
+  SgFrontend:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Frontend ${Ambiente} - HTTP publico y SSH solo desde mi IP"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP publico (la pagina del sistema)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: SSH solo desde mi IP
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIp
+      SecurityGroupEgress:
+        - Description: HTTP saliente (paquetes apt)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: HTTPS saliente (NodeSource, npm, GitHub)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub "${Proyecto}-${Ambiente}-sg-frontend" }
+
+  SgBackend:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Backend ${Ambiente} - API 8000 y SSH solo desde mi IP. MySQL NO se expone"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH solo desde mi IP
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIp
+      SecurityGroupEgress:
+        - Description: HTTP saliente (paquetes apt)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: HTTPS saliente (NodeSource, npm, GitHub, Secrets Manager)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub "${Proyecto}-${Ambiente}-sg-backend" }
+
+  # Reglas separadas para evitar dependencia circular entre los dos SG
+  ApiDesdeFrontend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: API 8000 desde el frontend por red privada
+      GroupId: !GetAtt SgBackend.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !GetAtt SgFrontend.GroupId
+
+  FrontendHaciaApi:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Salida del frontend hacia la API 8000 del backend
+      GroupId: !GetAtt SgFrontend.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      DestinationSecurityGroupId: !GetAtt SgBackend.GroupId
+
+  ApiPublica:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EsPublico
+    Properties:
+      Description: API 8000 abierta a internet (backend publicado)
+      GroupId: !GetAtt SgBackend.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      CidrIp: 0.0.0.0/0
+
+Outputs:
+  SgFrontendId:
+    Value: !GetAtt SgFrontend.GroupId
+  SgBackendId:
+    Value: !GetAtt SgBackend.GroupId

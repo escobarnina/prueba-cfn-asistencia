@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Stack PRINCIPAL - Sistema de Asistencia (2 servidores, sin Docker) con plantillas anidadas.
+  Orquesta 4 capas: red -> seguridad -> identidad -> servidor (backend y frontend).
+  Las rutas TemplateURL son locales; 'aws cloudformation package' las sube a S3 y las reemplaza.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [W3002]   # TemplateURL local a proposito: lo resuelve 'package' en el pipeline
+
+Parameters:
+  Proyecto:
+    Type: String
+    Default: asistencia
+    AllowedPattern: "^[a-z0-9-]{3,15}$"
+  Ambiente:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, prod]
+  MiIp:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/32$"
+    ConstraintDescription: Debe ser UNA IP en formato x.x.x.x/32 (https://checkip.amazonaws.com)
+    Description: Unica IP que puede entrar por SSH.
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  RepoUrl:
+    Type: String
+    Default: https://github.com/escobarnina/Mi-asistencia.git
+  RepoRama:
+    Type: String
+    Default: main
+  AdminEmail:
+    Type: String
+    Default: admin@ejemplo.com
+  CargarSemilla:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  BackendPublico:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: true = puerto 8000 abierto a internet (backend publicado). false = solo via frontend.
+
+# Configuracion por ambiente (todo dentro de la capa gratuita)
+Mappings:
+  EnvConfig:
+    dev:
+      TipoInstancia: t3.micro
+      DiscoBackend: 20
+      DiscoFrontend: 10
+    qa:
+      TipoInstancia: t3.micro
+      DiscoBackend: 20
+      DiscoFrontend: 10
+    prod:
+      TipoInstancia: t3.micro
+      DiscoBackend: 20
+      DiscoFrontend: 10
+
+Resources:
+  # 1. Red: VPC + subred publica + Internet Gateway
+  RedStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: red.yaml
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Ambiente: !Ref Ambiente
+
+  # 2. Seguridad de red: Security Groups
+  SeguridadStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: seguridad.yaml
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Ambiente: !Ref Ambiente
+        VpcId: !GetAtt RedStack.Outputs.VpcId
+        MiIp: !Ref MiIp
+        BackendPublico: !Ref BackendPublico
+
+  # 3. Identidad: llave SSH, secreto del admin y rol IAM del backend
+  IdentidadStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: identidad.yaml
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Ambiente: !Ref Ambiente
+
+  # 4a. Servidor BACKEND (plantilla reutilizable)
+  BackendServerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: servidor.yaml
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Ambiente: !Ref Ambiente
+        Rol: backend
+        TipoInstancia: !FindInMap [EnvConfig, !Ref Ambiente, TipoInstancia]
+        TamanoDisco: !FindInMap [EnvConfig, !Ref Ambiente, DiscoBackend]
+        AmiId: !Ref UbuntuAmiId
+        SubredId: !GetAtt RedStack.Outputs.SubredPublicaId
+        SecurityGroupId: !GetAtt SeguridadStack.Outputs.SgBackendId
+        NombreLlave: !GetAtt IdentidadStack.Outputs.NombreLlave
+        PerfilInstancia: !GetAtt IdentidadStack.Outputs.PerfilBackend
+        ArnSecretoAdmin: !GetAtt IdentidadStack.Outputs.ArnSecretoAdmin
+        AdminEmail: !Ref AdminEmail
+        CargarSemilla: !Ref CargarSemilla
+        RepoUrl: !Ref RepoUrl
+        RepoRama: !Ref RepoRama
+
+  # 4b. Servidor FRONTEND (misma plantilla; necesita la IP privada del backend)
+  FrontendServerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: servidor.yaml
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Ambiente: !Ref Ambiente
+        Rol: frontend
+        TipoInstancia: !FindInMap [EnvConfig, !Ref Ambiente, TipoInstancia]
+        TamanoDisco: !FindInMap [EnvConfig, !Ref Ambiente, DiscoFrontend]
+        AmiId: !Ref UbuntuAmiId
+        SubredId: !GetAtt RedStack.Outputs.SubredPublicaId
+        SecurityGroupId: !GetAtt SeguridadStack.Outputs.SgFrontendId
+        NombreLlave: !GetAtt IdentidadStack.Outputs.NombreLlave
+        BackendIpPrivada: !GetAtt BackendServerStack.Outputs.IpPrivada
+        RepoUrl: !Ref RepoUrl
+        RepoRama: !Ref RepoRama
+
+Outputs:
+  Ambiente:
+    Value: !Ref Ambiente
+  FrontendUrl:
+    Description: El sistema completo (esperar 5-8 min despues de CREATE_COMPLETE).
+    Value: !Sub "http://${FrontendServerStack.Outputs.IpPublica}"
+  HealthViaFrontend:
+    Description: Salud del backend pasando por nginx.
+    Value: !Sub "http://${FrontendServerStack.Outputs.IpPublica}/api/health"
+  BackendUrl:
+    Description: Salud del backend publicado (solo responde si BackendPublico=true).
+    Value: !Sub "http://${BackendServerStack.Outputs.IpPublica}:8000/api/health"
+  SshBackend:
+    Value: !Sub "ssh -i ${Proyecto}-${Ambiente}-llave.pem ubuntu@${BackendServerStack.Outputs.IpPublica}"
+  SshFrontend:
+    Value: !Sub "ssh -i ${Proyecto}-${Ambiente}-llave.pem ubuntu@${FrontendServerStack.Outputs.IpPublica}"
+  LlavePrivadaEnParameterStore:
+    Description: Systems Manager > Parameter Store > este nombre > Show decrypted value
+    Value: !Sub "/ec2/keypair/${IdentidadStack.Outputs.IdLlave}"
+  SecretoAdmin:
+    Description: Secrets Manager > este secreto > Retrieve secret value (usuario = AdminEmail)
+    Value: !GetAtt IdentidadStack.Outputs.ArnSecretoAdmin
