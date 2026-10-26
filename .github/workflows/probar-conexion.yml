@@ -1,0 +1,41 @@
+# =====================================================================
+#  Prueba de la conexión GitHub -> AWS (no crea nada, solo lee).
+#  Se ejecuta a mano: Actions -> "Probar conexion AWS" -> Run workflow (rama main).
+# =====================================================================
+name: Probar conexion AWS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "355628740150"     # <-- reemplaza por el número de TU cuenta AWS
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Asumir el rol con OIDC (sin llaves)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/asistencia-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 2. ¿Quién soy en AWS?
+        run: aws sts get-caller-identity
+
+      - name: 3. ¿Puedo usar el bucket de plantillas?
+        run: |
+          aws s3 ls "s3://asistencia-cfn-plantillas-${AWS_ACCOUNT_ID}" && echo "OK: bucket accesible"
+          echo "prueba $(date -u)" > prueba.txt
+          aws s3 cp prueba.txt "s3://asistencia-cfn-plantillas-${AWS_ACCOUNT_ID}/prueba/prueba.txt"
+          echo "OK: puedo subir plantillas"
+
+      - name: 4. ¿Puedo validar una plantilla?
+        run: |
+          aws cloudformation validate-template --template-body '{"Resources":{"X":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}' \
+            && echo "OK: CloudFormation responde"
