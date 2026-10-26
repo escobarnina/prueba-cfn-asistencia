@@ -14,7 +14,7 @@ Parameters:
     Description: Dueño del repositorio en GitHub.
   GitHubRepo:
     Type: String
-    Default: Mi-asistencia
+    Default: prueba-cfn-asistencia
   RamaDespliegue:
     Type: String
     Default: main
