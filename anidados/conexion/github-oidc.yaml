@@ -15,6 +15,16 @@ Parameters:
   GitHubRepo:
     Type: String
     Default: prueba-cfn-asistencia
+  GitHubOwnerId:
+    Type: String
+    Default: "110944739"
+    Description: >-
+      ID numerico del dueño. GitHub emite el sub como repo:dueño@ID/repo@ID:ref:...
+      (visible en el paso 0 de "Probar conexion AWS").
+  GitHubRepoId:
+    Type: String
+    Default: "1433785066"
+    Description: ID numerico del repositorio (ver GitHubOwnerId).
   RamaDespliegue:
     Type: String
     Default: main
@@ -181,7 +191,7 @@ Resources:
             Condition:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": sts.amazonaws.com
-                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${RamaDespliegue}"
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${RamaDespliegue}"
       Policies:
         - PolicyName: desplegar-stack-del-proyecto
           PolicyDocument:
