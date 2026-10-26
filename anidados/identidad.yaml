@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Capa 3 - IDENTIDAD Y SECRETOS. Llave SSH, contrasena del admin en Secrets Manager
+  y rol IAM minimo para que el backend lea SOLO ese secreto.
+
+Parameters:
+  Proyecto:
+    Type: String
+  Ambiente:
+    Type: String
+
+Resources:
+  # AWS genera la llave y guarda la parte privada cifrada en
+  # Systems Manager > Parameter Store > /ec2/keypair/<id>
+  LlaveSsh:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${Proyecto}-${Ambiente}-llave"
+      KeyType: ed25519
+
+  # La contrasena del admin la genera Secrets Manager: no esta en el repo,
+  # ni en los parametros, ni en el user_data.
+  AdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      # Prefijo asistencia-app/ (el rol de despliegue solo puede tocar secretos con este prefijo)
+      # + 8 caracteres del StackId para no chocar con un secreto borrado que sigue en papelera 7 dias
+      Name: !Join
+        - ""
+        - - !Sub "asistencia-app/${Ambiente}/admin-"
+          - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+      Description: !Sub "Contrasena del administrador inicial de ${Proyecto}-${Ambiente}"
+      GenerateSecretString:
+        PasswordLength: 16
+        ExcludePunctuation: true
+      Tags:
+        - { Key: proyecto, Value: !Ref Proyecto }
+        - { Key: ambiente, Value: !Ref Ambiente }
+
+  # Path /asistencia-app/: el rol de despliegue solo puede administrar roles bajo este path
+  RolBackend:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /asistencia-app/
+      Description: Permite al backend leer solo la contrasena del admin
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: leer-secreto-admin
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AdminSecret
+
+  PerfilBackend:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /asistencia-app/
+      Roles: [!Ref RolBackend]
+
+Outputs:
+  NombreLlave:
+    Value: !Ref LlaveSsh
+  IdLlave:
+    Value: !GetAtt LlaveSsh.KeyPairId
+  ArnSecretoAdmin:
+    Value: !Ref AdminSecret
+  PerfilBackend:
+    Value: !Ref PerfilBackend

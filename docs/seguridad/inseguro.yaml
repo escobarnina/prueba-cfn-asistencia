@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SOLO PARA LA DEMO DE ESCANEO - NO DESPLEGAR.
+  Traducción "ingenua" del backend: lo que los escáneres deben detectar.
+  Compárala con anidados/ (versión corregida).
+
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  MiIp:
+    Type: String
+    Default: 0.0.0.0/0                 # MAL: SSH abierto a todo internet por defecto
+  AdminPassword:
+    Type: String
+    Default: Admin1234                 # MAL: contraseña en texto plano y sin NoEcho
+
+Resources:
+  SgBackend:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: backend
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp              # MAL: sin descripción
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIp
+        - IpProtocol: tcp
+          FromPort: 3306               # MAL: MySQL expuesto a internet
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"             # MAL: salida a cualquier puerto y destino
+          CidrIp: 0.0.0.0/0
+
+  Backend:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.micro
+      SecurityGroupIds: [!GetAtt SgBackend.GroupId]
+      # MAL: sin MetadataOptions -> IMDSv1 permitido
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20             # MAL: disco sin cifrar
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # MAL: secretos escritos dentro del user_data (visibles en la consola EC2)
+          echo "ADMIN_PASSWORD=${AdminPassword}" >> /opt/asistencia/.env
+          echo "JWT_SECRET=mi_secreto_super_largo_123" >> /opt/asistencia/.env
+          echo "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" >> /opt/asistencia/.env
